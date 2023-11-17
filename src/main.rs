@@ -20,11 +20,15 @@ impl Crawler {
 
     async fn explore_url(&mut self, url: &str) -> Result<bool, reqwest::Error> {
         let response = make_request(&self.client, url).await?;
+        let base_url = Url::parse(url).unwrap();
         let links = extract_hrefs(&response);
-        // TODO check if the link is relative, and if so, use url to turn it into an absolute
-        // url
+
         for link in &links {
-            self.queue.push_back(link.clone());
+            if let Ok(absolute_url) = Url::parse(link) {
+                self.queue.push_back(absolute_url.to_string());
+            } else {
+                self.queue.push_back(base_url.join(link).unwrap().to_string());
+            }
         }
 
         Ok(self.graph.insert(url.to_string(), links).is_some())
