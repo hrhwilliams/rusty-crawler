@@ -1,12 +1,8 @@
 use std::collections::{HashMap, VecDeque};
-
+use std::{fs, io};
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
-use sqlx::{migrate::MigrateDatabase, Sqlite, SqlitePool};
-use tokio::io;
 use url::Url;
-
-const DB_URL: &str = "sqlite://crawler-graph.db";
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Crawler {
@@ -94,29 +90,12 @@ async fn make_request(client: &reqwest::Client, url: &str) -> Result<String>  {
         .await.or(Err(CrawlerError::RequestError))
 }
 
-async fn init_db() {
-    if !Sqlite::database_exists(DB_URL).await.unwrap_or(false) {
-        Sqlite::create_database(DB_URL).await
-            .expect("Failed to create database");
-    } else {
-        println!("Using database: {}", DB_URL);
-    }
-
-    let db = SqlitePool::connect(DB_URL).await.unwrap();
-    let result = sqlx::query(
-    "CREATE TABLE IF NOT EXISTS nodes (
-         id INTEGER PRIMARY KEY AUTOINCREMENT,
-         url TEXT NOT NULL);").execute(&db)
-        .await
-        .unwrap();
-}
-
 #[tokio::main]
 async fn main() -> reqwest::Result<()>{
     let mut crawler: Crawler;
 
-    if let Ok(crawler_json) = std::fs::File::open("crawler.json") {
-        let reader = std::io::BufReader::new(crawler_json);
+    if let Ok(crawler_json) = fs::File::open("crawler.json") {
+        let reader = io::BufReader::new(crawler_json);
         crawler = serde_json::from_reader(reader)
             .expect("Error deserializing crawler from IO buffer");
     } else {
