@@ -61,25 +61,21 @@ impl Crawler {
 fn extract_hrefs_from(base_url: Url, body: &str) -> Vec<String> {
     let fragment = Html::parse_document(body);
     let a_selector = Selector::parse("a").unwrap();
-    let mut links = Vec::<String>::new();
 
-    for element in fragment.select(&a_selector) {
-        if let Some(href) = element.value().attr("href") {
-            if let Ok(mut href_url) = Url::parse(href) {
-                href_url.set_fragment(None);
-                if href_url.has_host() {
-                    links.push(href_url.to_string());
-                }
-            } else if let Ok(mut href_url) = base_url.join(href) {
-                href_url.set_fragment(None);
-                if href_url.has_host() {
-                    links.push(href_url.to_string());
-                }
-            }
-        }
-    }
+    fragment.select(&a_selector)
+        .filter_map(|element| {
+            element.value().attr("href").and_then(|href| {
+                let mut href_url = if let Ok(url) = Url::parse(href) {
+                    url
+                } else {
+                    base_url.join(href).ok()?
+                };
 
-    links
+                href_url.set_fragment(None);
+                href_url.has_host().then(|| href_url.to_string())
+            })
+        })
+        .collect()
 }
 
 async fn make_request(client: &reqwest::Client, url: &str) -> Result<String>  {
