@@ -1,7 +1,10 @@
 use std::collections::{HashMap, VecDeque};
 
 use scraper::{Html, Selector};
+use sqlx::{migrate::MigrateDatabase, Sqlite, SqlitePool};
 use url::Url;
+
+const DB_URL: &str = "sqlite://crawler-graph.db";
 
 struct Crawler {
     client: reqwest::Client,
@@ -64,12 +67,29 @@ async fn make_request(client: &reqwest::Client, url: &str) -> Result<String, req
 
 #[tokio::main]
 async fn main() -> reqwest::Result<()>{
+    if !Sqlite::database_exists(DB_URL).await.unwrap_or(false) {
+        Sqlite::create_database(DB_URL).await
+            .expect("Failed to create database");
+    } else {
+        println!("Using database: {}", DB_URL);
+    }
+
+    let db = SqlitePool::connect(DB_URL).await.unwrap();
+    let result = sqlx::query(
+    "CREATE TABLE IF NOT EXISTS nodes (
+         id INTEGER PRIMARY KEY AUTOINCREMENT,
+         url TEXT NOT NULL);").execute(&db)
+        .await
+        .unwrap();
+
     let start = "https://en.wikipedia.org/wiki/Main_Page";
     let mut crawler = Crawler::new();
     crawler.explore_url(&start).await
         .expect("Failed to explore starting page");
 
-    for _ in 0..3 {
+    println!("{}" ,crawler.queue.len());
+
+    for _ in 0..crawler.queue.len() {
         crawler.explore_queue().await
             .expect("Failed to explore from queue");
     }
