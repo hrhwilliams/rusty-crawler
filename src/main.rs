@@ -1,12 +1,16 @@
 use std::collections::{HashMap, VecDeque};
 
 use scraper::{Html, Selector};
+use serde::{Deserialize, Serialize};
 use sqlx::{migrate::MigrateDatabase, Sqlite, SqlitePool};
+use tokio::io;
 use url::Url;
 
 const DB_URL: &str = "sqlite://crawler-graph.db";
 
+#[derive(Debug, Serialize, Deserialize)]
 struct Crawler {
+    #[serde(skip)]
     client: reqwest::Client,
     graph: HashMap::<String, Vec<String>>,
     queue: VecDeque<String>
@@ -18,7 +22,7 @@ type Result<T> = std::result::Result<T, CrawlerError>;
 enum CrawlerError {
     RequestError,
     EmptyQueue,
-    GraphInsertError
+    UrlParseError,
 }
 
 impl Crawler {
@@ -31,27 +35,26 @@ impl Crawler {
     }
 
     async fn explore_url(&mut self, url: String) -> Result<()> {
-        if self.graph.contains_key(&url) {
-            return Ok(());
-        }
+        if let Ok(parsed_url) = Url::parse(&url) {
+            let response = make_request(&self.client, parsed_url.as_str()).await
+                .or(Err(CrawlerError::RequestError))?;
 
-        let response = make_request(&self.client, &url).await
-            .or(Err(CrawlerError::RequestError))?;
+            let links = extract_hrefs_from(parsed_url, &response);
+            let mut links_deque = VecDeque::<String>::from(links.clone());
 
-        let links = extract_urls(&url, &response);
-        let mut links_deque = VecDeque::<String>::from(links.clone());
-        self.queue.append(&mut links_deque);
-
-        if self.graph.insert(url, links).is_none() {
+            self.queue.append(&mut links_deque);
+            self.graph.insert(url, links);
             Ok(())
         } else {
-            Err(CrawlerError::GraphInsertError)
+            Err(CrawlerError::UrlParseError)
         }
     }
 
-    async fn explore_queue(&mut self) -> Result<()> {
+    async fn explore_queue(&mut self, ignore_already_crawled: bool) -> Result<()> {
         if let Some(url) = self.queue.pop_front() {
-            self.explore_url(url).await?;
+            if !self.graph.contains_key(&url) || !ignore_already_crawled {
+                self.explore_url(url).await?;
+            }
             Ok(())
         } else {
             Err(CrawlerError::EmptyQueue)
@@ -59,18 +62,23 @@ impl Crawler {
     }
 }
 
-fn extract_urls(url: &str, body: &str) -> Vec<String> {
-    let base_url = Url::parse(url).unwrap();
+fn extract_hrefs_from(base_url: Url, body: &str) -> Vec<String> {
     let fragment = Html::parse_document(body);
     let a_selector = Selector::parse("a").unwrap();
     let mut links = Vec::<String>::new();
 
     for element in fragment.select(&a_selector) {
         if let Some(href) = element.value().attr("href") {
-            if let Ok(href_url) = Url::parse(href) {
-                links.push(href_url.to_string());
-            } else if let Ok(href_url) = base_url.join(href) {
-                links.push(href_url.to_string());
+            if let Ok(mut href_url) = Url::parse(href) {
+                href_url.set_fragment(None);
+                if href_url.has_host() {
+                    links.push(href_url.to_string());
+                }
+            } else if let Ok(mut href_url) = base_url.join(href) {
+                href_url.set_fragment(None);
+                if href_url.has_host() {
+                    links.push(href_url.to_string());
+                }
             }
         }
     }
@@ -105,20 +113,28 @@ async fn init_db() {
 
 #[tokio::main]
 async fn main() -> reqwest::Result<()>{
-    let start = String::from("https://en.wikipedia.org/wiki/Main_Page");
-    let mut crawler = Crawler::new();
-    crawler.explore_url(start).await
-        .expect("Failed to explore starting page");
+    let mut crawler: Crawler;
 
-    println!("{}" ,crawler.queue.len());
+    if let Ok(crawler_json) = std::fs::File::open("crawler.json") {
+        let reader = std::io::BufReader::new(crawler_json);
+        crawler = serde_json::from_reader(reader)
+            .expect("Error deserializing crawler from IO buffer");
+    } else {
+        let start = String::from("https://en.wikipedia.org/wiki/Main_Page");
+        crawler = Crawler::new();
+        crawler.explore_url(start).await
+            .expect("Failed to explore starting page");
+    }
 
     for i in 0..10 {
         println!("{}", i);
-        crawler.explore_queue().await
+        crawler.explore_queue(true).await
             .expect("Failed to explore from queue");
     }
 
-    println!("Graph has {} explored nodes", crawler.graph.keys().len());
+    let serialized = serde_json::to_string(&crawler).unwrap();
+    std::fs::write("crawler.json", serialized)
+        .expect("Failed to serialize crawler.");
 
     Ok(())
 }
@@ -141,7 +157,7 @@ mod tests {
           <a href=\"../other_rel\">
         </body></html>";
 
-        let links = extract_urls("https://www.example.com/examples/", body);
+        let links = extract_hrefs_from(Url::parse("https://www.example.com/examples/").unwrap(), body);
 
         assert_eq!(links, [
             "https://www.example.com/",
@@ -159,12 +175,12 @@ mod tests {
         let body = "
         <html><body>
           <h1>header</h1>
-          <a href=\"#item\">
+          <a href=\"#item1\">
           <a href=\"mailto:example@gmail.com\">
         </body></html>";
 
-        let links = extract_urls("https://www.example.com/examples/", body);
+        let links = extract_hrefs_from(Url::parse("https://www.example.com/examples/").unwrap(), body);
 
-        assert_eq!(links, Vec::<String>::new());
+        assert_eq!(links, ["https://www.example.com/examples/"]);
     }
 }
