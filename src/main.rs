@@ -12,6 +12,15 @@ struct Crawler {
     queue: VecDeque<String>
 }
 
+type Result<T> = std::result::Result<T, CrawlerError>;
+
+#[derive(Clone, Debug)]
+enum CrawlerError {
+    RequestError,
+    EmptyQueue,
+    GraphInsertError
+}
+
 impl Crawler {
     fn new() -> Self {
         Self {
@@ -21,52 +30,63 @@ impl Crawler {
         }
     }
 
-    async fn explore_url(&mut self, url: &str) -> Result<bool, reqwest::Error> {
-        let response = make_request(&self.client, url).await?;
-        let base_url = Url::parse(url).unwrap();
-        let links = extract_hrefs(&response);
-
-        for link in &links {
-            if let Ok(absolute_url) = Url::parse(link) {
-                self.queue.push_back(absolute_url.to_string());
-            } else {
-                self.queue.push_back(base_url.join(link).unwrap().to_string());
-            }
+    async fn explore_url(&mut self, url: String) -> Result<()> {
+        if self.graph.contains_key(&url) {
+            return Ok(());
         }
 
-        Ok(self.graph.insert(url.to_string(), links).is_some())
+        let response = make_request(&self.client, &url).await
+            .or(Err(CrawlerError::RequestError))?;
+
+        let links = extract_urls(&url, &response);
+        let mut links_deque = VecDeque::<String>::from(links.clone());
+        self.queue.append(&mut links_deque);
+
+        if self.graph.insert(url, links).is_none() {
+            Ok(())
+        } else {
+            Err(CrawlerError::GraphInsertError)
+        }
     }
 
-    async fn explore_queue(&mut self) -> Result<bool, reqwest::Error> {
-        let url = self.queue.pop_front();
-        self.explore_url(&url.unwrap()).await
+    async fn explore_queue(&mut self) -> Result<()> {
+        if let Some(url) = self.queue.pop_front() {
+            self.explore_url(url).await?;
+            Ok(())
+        } else {
+            Err(CrawlerError::EmptyQueue)
+        }
     }
 }
 
-fn extract_hrefs(body: &str) -> Vec<String> {
+fn extract_urls(url: &str, body: &str) -> Vec<String> {
+    let base_url = Url::parse(url).unwrap();
     let fragment = Html::parse_document(body);
     let a_selector = Selector::parse("a").unwrap();
     let mut links = Vec::<String>::new();
 
     for element in fragment.select(&a_selector) {
         if let Some(href) = element.value().attr("href") {
-            links.push(href.into());
+            if let Ok(href_url) = Url::parse(href) {
+                links.push(href_url.to_string());
+            } else if let Ok(href_url) = base_url.join(href) {
+                links.push(href_url.to_string());
+            }
         }
     }
 
     links
 }
 
-async fn make_request(client: &reqwest::Client, url: &str) -> Result<String, reqwest::Error>  {
+async fn make_request(client: &reqwest::Client, url: &str) -> Result<String>  {
     client.get(url)
         .send()
-        .await?
+        .await.unwrap()
         .text()
-        .await
+        .await.or(Err(CrawlerError::RequestError))
 }
 
-#[tokio::main]
-async fn main() -> reqwest::Result<()>{
+async fn init_db() {
     if !Sqlite::database_exists(DB_URL).await.unwrap_or(false) {
         Sqlite::create_database(DB_URL).await
             .expect("Failed to create database");
@@ -81,15 +101,19 @@ async fn main() -> reqwest::Result<()>{
          url TEXT NOT NULL);").execute(&db)
         .await
         .unwrap();
+}
 
-    let start = "https://en.wikipedia.org/wiki/Main_Page";
+#[tokio::main]
+async fn main() -> reqwest::Result<()>{
+    let start = String::from("https://en.wikipedia.org/wiki/Main_Page");
     let mut crawler = Crawler::new();
-    crawler.explore_url(&start).await
+    crawler.explore_url(start).await
         .expect("Failed to explore starting page");
 
     println!("{}" ,crawler.queue.len());
 
-    for _ in 0..crawler.queue.len() {
+    for i in 0..10 {
+        println!("{}", i);
         crawler.explore_queue().await
             .expect("Failed to explore from queue");
     }
@@ -99,7 +123,48 @@ async fn main() -> reqwest::Result<()>{
     Ok(())
 }
 
+#[cfg(test)]
 mod tests {
     use super::*;
 
+    #[test]
+    fn test_extract_urls() {
+        // TODO
+        // ignore mailto:, #, 
+        let body = "
+        <html><body>
+          <h1>header</h1>
+          <a href=\"https://www.example.com\">
+          <a href=\"https://www.trailing-slash.com/\">
+          <a href=\"https://www.example2.com\">
+          <a href=\"/relative\">
+          <a href=\"../other_rel\">
+        </body></html>";
+
+        let links = extract_urls("https://www.example.com/examples/", body);
+
+        assert_eq!(links, [
+            "https://www.example.com/",
+            "https://www.trailing-slash.com/",
+            "https://www.example2.com/",
+            "https://www.example.com/relative", 
+            "https://www.example.com/other_rel"
+        ]);
+    }
+
+    #[test]
+    fn test_extract_urls_ignores() {
+        // TODO
+        // ignore mailto:, #, 
+        let body = "
+        <html><body>
+          <h1>header</h1>
+          <a href=\"#item\">
+          <a href=\"mailto:example@gmail.com\">
+        </body></html>";
+
+        let links = extract_urls("https://www.example.com/examples/", body);
+
+        assert_eq!(links, Vec::<String>::new());
+    }
 }
