@@ -1,6 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
+use futures::future;
 use url::Url;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -21,12 +22,15 @@ pub enum CrawlerError {
 }
 
 impl Crawler {
-    pub fn new() -> Self {
-        Self {
+    pub fn new(url: String) -> Self {
+        let mut crawler = Crawler {
             client: reqwest::Client::new(),
             graph: HashMap::<String, Vec<String>>::new(),
             queue: VecDeque::<String>::new()
-        }
+        };
+
+        crawler.queue.push_front(url);
+        crawler
     }
 
     pub async fn explore_url(&mut self, url: String) -> Result<()> {
@@ -34,7 +38,7 @@ impl Crawler {
             let response = make_request(&self.client, parsed_url.as_str()).await
                 .or(Err(CrawlerError::RequestError))?;
 
-            let links = extract_hrefs_from(parsed_url, &response);
+            let links = extract_hrefs_from(&parsed_url.to_string(), &response);
             let mut links_deque = VecDeque::<String>::from(links.clone());
 
             self.queue.append(&mut links_deque);
@@ -56,13 +60,41 @@ impl Crawler {
         }
     }
 
-    pub fn add_to_queue(mut self, url: String) -> Self {
+    pub async fn explore_queue_multi(&mut self, n: usize) -> Result<()> {
+        let urls = self.queue.drain(0..n);
+
+        let responses = future::join_all(urls.map(|url| {
+            let client = &self.client;
+            async move {
+                client.get(url).send().await
+            }
+        })).await;
+
+        for response in responses {
+            if let Ok(content) = response {
+                let url = content.url().to_string();
+                let body = content.text().await.unwrap();
+                let links = extract_hrefs_from(&url, &body);
+                let mut links_deque = VecDeque::<String>::from(links.clone());
+                self.queue.append(&mut links_deque);
+                self.graph.insert(url, links);
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn add_to_queue(&mut self, url: String) {
         self.queue.push_back(url);
-        self
+    }
+
+    pub fn explored_nodes(&self) -> usize {
+        self.graph.len()
     }
 }
 
-fn extract_hrefs_from(base_url: Url, body: &str) -> Vec<String> {
+fn extract_hrefs_from(url: &str, body: &str) -> Vec<String> {
+    let base_url = Url::parse(url).expect("Failed to parse URL");
     let fragment = Html::parse_document(body);
     let a_selector = Selector::parse("a").unwrap();
 
@@ -108,7 +140,7 @@ mod tests {
         <a href=\"../other_rel\">
         </body></html>";
 
-        let links = extract_hrefs_from(Url::parse("https://www.example.com/examples/").unwrap(), body);
+        let links = extract_hrefs_from("https://www.example.com/examples/", body);
 
         assert_eq!(links, [
             "https://www.example.com/",
@@ -130,7 +162,7 @@ mod tests {
         <a href=\"mailto:example@gmail.com\">
         </body></html>";
 
-        let links = extract_hrefs_from(Url::parse("https://www.example.com/examples/").unwrap(), body);
+        let links = extract_hrefs_from("https://www.example.com/examples/", body);
 
         assert_eq!(links, ["https://www.example.com/examples/"]);
     }
